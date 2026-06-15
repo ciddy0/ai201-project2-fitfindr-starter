@@ -69,8 +69,34 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Filter by max_price
+    if max_price is not None:
+        listings = [l for l in listings if l["price"] <= max_price]
+
+    # Filter by size
+    if size is not None:
+        size_lower = size.lower()
+        listings = [l for l in listings if size_lower in l["size"].lower()]
+
+    # Score by keyword relevance
+    keywords = description.lower().split()
+    scored = []
+    for listing in listings:
+        text = " ".join([
+            listing["title"],
+            listing["description"],
+            listing["category"],
+            " ".join(listing["style_tags"]),
+        ]).lower()
+        score = sum(1 for kw in keywords if kw in text)
+        if score > 0:
+            scored.append((score, listing))
+
+    # Sort by score descending and return listing dicts
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [listing for _, listing in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +126,44 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    client = _get_groq_client()
+
+    item_desc = (
+        f"{new_item['title']} — {new_item['description']}. "
+        f"Category: {new_item['category']}, Colors: {', '.join(new_item['colors'])}, "
+        f"Style: {', '.join(new_item['style_tags'])}"
+    )
+
+    if not wardrobe.get("items"):
+        prompt = (
+            f"I just found this thrifted item: {item_desc}\n\n"
+            "I don't have a wardrobe listed yet. Suggest 1–2 outfit ideas "
+            "with general pieces that would pair well with this item. "
+            "Mention the vibe, occasions, and what kinds of items to look for."
+        )
+    else:
+        wardrobe_lines = []
+        for w in wardrobe["items"]:
+            wardrobe_lines.append(
+                f"- {w['name']} ({w['category']}, colors: {', '.join(w['colors'])})"
+            )
+        wardrobe_text = "\n".join(wardrobe_lines)
+        prompt = (
+            f"I just found this thrifted item: {item_desc}\n\n"
+            f"Here's what I already own:\n{wardrobe_text}\n\n"
+            "Suggest 1–2 complete outfits using the new item and specific pieces "
+            "from my wardrobe. Name each wardrobe piece you pick."
+        )
+
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": "You are a helpful fashion stylist."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +195,29 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return "Could not generate a caption — no outfit suggestion was provided."
+
+    client = _get_groq_client()
+
+    prompt = (
+        f"Write a 2–4 sentence Instagram/TikTok caption for an OOTD post.\n\n"
+        f"Thrifted item: {new_item['title']}, ${new_item['price']:.0f} on {new_item['platform']}.\n"
+        f"Outfit idea: {outfit}\n\n"
+        "Guidelines:\n"
+        "- Casual, authentic tone (like a real person posting, not a brand)\n"
+        "- Mention the item name, price, and platform naturally (once each)\n"
+        "- Capture the outfit vibe in specific terms\n"
+        "- No hashtags unless they feel organic\n"
+        "- 2–4 sentences max"
+    )
+
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": "You are a creative social media copywriter who specializes in thrift fashion content."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.9,
+    )
+    return response.choices[0].message.content
