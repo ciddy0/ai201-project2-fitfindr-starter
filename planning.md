@@ -103,27 +103,42 @@ If the `outfit` string is empty or whitespace-only, the tool returns a descripti
 
 **How does your agent decide which tool to call next?**
 
-The agent uses a **sequential pipeline with early-exit branching**. The three tools have a strict dependency chain: `search_listings` produces data needed by `suggest_outfit`, which produces data needed by `create_fit_card`, so the order is fixed. The only branching is an early-exit check after `search_listings` returns empty results.
+The agent uses a **`while` loop driven by a `_decide_next_step(session)` function** that inspects the session dict each iteration and dynamically selects which tool to call next. Rather than executing tools in a hardcoded sequence, the loop checks what data has been populated so far and picks the appropriate next action. If any step produces a result that makes downstream tools inappropriate (e.g., empty search results setting `session["error"]`), the decision function returns `"done"` and the loop terminates early — the remaining tools are never called.
+
+**The decision function (`_decide_next_step`):**
+
+```python
+def _decide_next_step(session: dict) -> str:
+    if not session["parsed"]:
+        return "parse"
+    if not session["search_results"] and session["error"] is None:
+        return "search"
+    if session["selected_item"] and session["outfit_suggestion"] is None and session["error"] is None:
+        return "suggest"
+    if session["outfit_suggestion"] and session["fit_card"] is None and session["error"] is None:
+        return "create"
+    return "done"
+```
 
 **Step-by-step logic:**
 
 1. **Initialize session** — Call `_new_session(query, wardrobe)` to create the session dict with all fields set to defaults (empty lists, None values).
 
-2. **Parse the user query** — Use a hybrid approach: first try regex patterns to extract structured parameters, then fall back to an LLM call via Groq if regex doesn't find all parameters.
+2. **Enter the planning loop** — `while True:` calls `_decide_next_step(session)` each iteration to determine the next action.
 
-3. **Call `search_listings()`**, Pass `session["parsed"]["description"]`, `session["parsed"]["size"]`, and `session["parsed"]["max_price"]`.
-   - Store results in `session["search_results"]`.
-   - **BRANCH — If `session["search_results"]` is empty:** Set `session["error"]` to "No matching listings found for your search. Try broadening your description, removing the size or price filter, or searching for a different item." **Return the session immediately.** Do not proceed to steps 4–6.
+3. **Step "parse"** — `_decide_next_step` sees `session["parsed"]` is empty → returns `"parse"`. The agent calls `_parse_query(session)`, which uses regex to extract `description`, `size`, and `max_price` from the raw query and stores them in `session["parsed"]`.
 
-4. **Select top result** — Set `session["selected_item"] = session["search_results"][0]` (the highest-relevance listing).
+4. **Step "search"** — `_decide_next_step` sees `session["parsed"]` is populated but `session["search_results"]` is empty and no error → returns `"search"`. The agent calls `search_listings()` with the parsed parameters.
+   - If results are empty: sets `session["error"]`. On the next iteration, `_decide_next_step` sees the error and returns `"done"`.
+   - If results exist: sets `session["selected_item"]` to the top result.
 
-5. **Call `suggest_outfit()`** — Pass `session["selected_item"]` and `session["wardrobe"]`. Store the returned string in `session["outfit_suggestion"]`.
+5. **Step "suggest"** — `_decide_next_step` sees `session["selected_item"]` is set but `session["outfit_suggestion"]` is `None` → returns `"suggest"`. The agent calls `suggest_outfit()` with the selected item and wardrobe.
 
-6. **Call `create_fit_card()`** — Pass `session["outfit_suggestion"]` and `session["selected_item"]`. Store the returned string in `session["fit_card"]`.
+6. **Step "create"** — `_decide_next_step` sees `session["outfit_suggestion"]` is set but `session["fit_card"]` is `None` → returns `"create"`. The agent calls `create_fit_card()` with the outfit suggestion and selected item.
 
-7. **Return the session** — The completed session dict now contains all results. The caller (Gradio app's `handle_query()`) checks `session["error"]` first; if it is `None`, it displays the selected item, outfit suggestion, and fit card in three panels.
+7. **Step "done"** — `_decide_next_step` sees all fields are populated (or an error was set) → returns `"done"`. The loop breaks and the session is returned to the caller (Gradio app's `handle_query()`), which checks `session["error"]` first; if it is `None`, it displays the selected item, outfit suggestion, and fit card in three panels.
 
-**How the agent knows it's done:** The pipeline always terminates at step 7 (success) or at the early-exit branch in step 3 (no results).
+**How the agent knows it's done:** `_decide_next_step` returns `"done"` when either (a) all output fields are populated (happy path), or (b) `session["error"]` is set (failure path). The loop breaks and returns the session.
 
 ---
 
@@ -185,74 +200,63 @@ User Query ──► [ run_agent(query, wardrobe) ]
                         │
                         ▼
                ┌─────────────────┐
-               │  1. INIT SESSION │  _new_session(query, wardrobe)
-               │     session = {} │  Sets defaults for all fields
+               │  INIT SESSION    │  _new_session(query, wardrobe)
+               │  session = {}    │  Sets defaults for all fields
                └────────┬────────┘
                         │
                         ▼
-               ┌──────────────────────┐
-               │  2. PARSE QUERY       │  Hybrid: regex first, LLM fallback
-               │  "vintage tee <$30"  │  ──► {"description": "vintage graphic tee",
-               │                      │       "size": null, "max_price": 30.0}
-               │  session["parsed"]   │
-               └────────┬─────────────┘
+               ┌─────────────────────────────────┐
+               │         PLANNING LOOP            │
+               │   while True:                    │
+               │     step = _decide_next_step()   │
+               │                                  │
+               │   Inspects session state each    │
+               │   iteration and dynamically      │
+               │   selects the next tool to call.  │
+               └────────┬────────────────────────┘
                         │
-                        ▼
-               ┌──────────────────────┐
-               │  3. SEARCH LISTINGS   │  search_listings(desc, size, max_price)
-               │  Filter + score from │  ──► list[dict] sorted by relevance
-               │  listings.json (40)  │
-               │  session["search_    │
-               │       results"]      │
-               └────────┬─────────────┘
-                        │
-                   ┌────┴────┐
-                   │ Empty?  │
-                   └─┬─────┬─┘
-                 YES │     │ NO
-                     ▼     ▼
-          ┌──────────────┐  ┌──────────────────┐
-          │ SET ERROR     │  │ 4. SELECT TOP    │  session["selected_item"]
-          │ "No matching  │  │    RESULT        │     = search_results[0]
-          │  listings..." │  └────────┬─────────┘
-          └──────┬───────┘           │
-                 │                   ▼
-                 │          ┌────────────────────────┐
-                 │          │ 5. SUGGEST OUTFIT       │  suggest_outfit(
-                 │          │    LLM via Groq         │    selected_item, wardrobe)
-                 │          │    session["outfit_     │  ──► string
-                 │          │         suggestion"]    │
-                 │          └────────┬───────────────┘
-                 │                   │
-                 │          ┌────────┴─────────┐
-                 │          │ wardrobe empty?  │
-                 │          └─┬──────────────┬─┘
-                 │        YES │              │ NO
-                 │            ▼              ▼
-                 │   General styling    Specific outfits
-                 │   advice (LLM)       from wardrobe (LLM)
-                 │            \            /
-                 │             ▼          ▼
-                 │          ┌──────────────────────────┐
-                 │          │ 6. CREATE FIT CARD       │  create_fit_card(
-                 │          │   LLM via Groq (temp=0.9)│    outfit_suggestion,                    
-                 │          │    session["fit_card"]   │    selected_item)
-                 │          └────────┬─────────────────┘  ──► string (2-4 sentences)
-                 │                   │
-                 ▼                   ▼
-          ┌──────────────────────────────┐
-          │ 7. RETURN SESSION             │
-          │    error path: error is set,  │
-          │      outfit/fit_card are None │
-          │    happy path: all fields set │
-          └──────────────┬───────────────┘
-                         │
-                         ▼
-               [ Gradio handle_query() ]
-               Displays 3 panels:
-               - Listing details
-               - Outfit suggestion
-               - Fit card caption
+          ┌─────────────┼─────────────────────────────┐
+          ▼             ▼             ▼                ▼
+    ┌──────────┐ ┌───────────┐ ┌───────────┐  ┌────────────┐
+    │ "parse"  │ │ "search"  │ │ "suggest" │  │  "create"  │
+    │          │ │           │ │           │  │            │
+    │_parse_   │ │search_    │ │suggest_   │  │create_fit_ │
+    │ query()  │ │listings() │ │outfit()   │  │ card()     │
+    └────┬─────┘ └─────┬─────┘ └─────┬─────┘  └─────┬──────┘
+         │             │             │               │
+         ▼             ▼             ▼               ▼
+    session[     session[       session[         session[
+    "parsed"]   "search_       "outfit_         "fit_card"]
+                 results"]     suggestion"]
+                    │
+               ┌────┴────┐
+               │ Empty?  │
+               └─┬─────┬─┘
+             YES │     │ NO
+                 ▼     ▼
+          session[   session[
+          "error"]   "selected_item"]
+             │          = results[0]
+             │
+             ▼
+     _decide_next_step
+     sees error → "done"
+     (loop breaks, tools
+      skipped)
+
+          All paths eventually ──► _decide_next_step returns "done"
+                                           │
+                                           ▼
+                                  ┌─────────────────┐
+                                  │ RETURN SESSION   │
+                                  └────────┬────────┘
+                                           │
+                                           ▼
+                                 [ Gradio handle_query() ]
+                                 Displays 3 panels:
+                                 - Listing details
+                                 - Outfit suggestion
+                                 - Fit card caption
 ```
 
 ---
@@ -282,11 +286,13 @@ Write out what a full user interaction looks like from start to finish — tool 
 
 **Example user query:** "I'm looking for a vintage graphic tee under $30. I mostly wear baggy jeans and chunky sneakers. What's out there and how would I style it?"
 
-**Step 1: Initialize session and parse query**
+**Step 1: Initialize session and enter the planning loop**
 
-The agent calls `_new_session(query, wardrobe)` where wardrobe is the example wardrobe (10 items including baggy straight-leg jeans, chunky white sneakers, black combat boots, etc.).
+The agent calls `_new_session(query, wardrobe)` where wardrobe is the example wardrobe (10 items including baggy straight-leg jeans, chunky white sneakers, black combat boots, etc.). Then it enters the `while True` planning loop.
 
-Then it parses the query using the hybrid approach. Regex finds `under $30` → `max_price = 30.0`. No explicit size like "size M" is found, so `size = None`. The remaining description keywords are extracted as `"vintage graphic tee"`.
+**Loop iteration 1 — `_decide_next_step` returns `"parse"`**
+
+`session["parsed"]` is empty, so the decision function selects the parse step. `_parse_query(session)` runs regex on the query. It finds `under $30` → `max_price = 30.0`. No explicit size like "size M" is found, so `size = None`. The remaining description keywords are extracted as `"vintage graphic tee"`.
 
 Parsed result stored in `session["parsed"]`:
 ```json
@@ -297,7 +303,11 @@ Parsed result stored in `session["parsed"]`:
 }
 ```
 
-**Step 2: Call `search_listings("vintage graphic tee", None, 30.0)`**
+**Loop iteration 2 — `_decide_next_step` returns `"search"`**
+
+`session["parsed"]` is now populated but `session["search_results"]` is empty and no error is set, so the decision function selects the search step.
+
+**Call `search_listings("vintage graphic tee", None, 30.0)`**
 
 The tool loads all 40 listings, filters out any with `price > 30.0`, then scores remaining listings by keyword overlap with "vintage graphic tee" against each listing's title, description, style_tags, and category.
 
@@ -305,7 +315,7 @@ Top results returned (sorted by relevance):
 1. **lst_006** — "Graphic Tee — 2003 Tour Bootleg Style" — $24.00 on depop, size L, condition good. style_tags: graphic tee, vintage, grunge, streetwear, band tee. (High score: matches "graphic", "tee", "vintage")
 2. **lst_033** — "Vintage Band Tee — Faded Grey" — $19.00 on depop, size L, condition fair. style_tags: vintage, grunge, band tee, graphic tee. (High score: matches "vintage", "graphic", "tee")
 
-The list is not empty → no error is set. The agent stores results in `session["search_results"]` and selects the top result:
+The list is not empty → no error is set. The agent stores results in `session["search_results"]` and selects the top result as `session["selected_item"]`.
 
 `session["selected_item"]` = lst_006:
 ```json
@@ -324,7 +334,11 @@ The list is not empty → no error is set. The agent stores results in `session[
 }
 ```
 
-**Step 3: Call `suggest_outfit(selected_item, wardrobe)`**
+**Loop iteration 3 — `_decide_next_step` returns `"suggest"`**
+
+`session["selected_item"]` is set but `session["outfit_suggestion"]` is `None` and no error, so the decision function selects the suggest step.
+
+**Call `suggest_outfit(selected_item, wardrobe)`**
 
 The tool checks `wardrobe["items"]` — it has 10 items (not empty), so it builds a prompt listing the new graphic tee's details alongside the user's wardrobe pieces (baggy straight-leg jeans, wide-leg khaki trousers, white ribbed tank top, grey crewneck sweatshirt, black cropped zip hoodie, vintage black denim jacket, chunky white sneakers, black combat boots, brown leather belt, black crossbody bag).
 
@@ -338,7 +352,11 @@ The Groq LLM returns a string like:
 
 Stored in `session["outfit_suggestion"]`.
 
-**Step 4: Call `create_fit_card(outfit_suggestion, selected_item)`**
+**Loop iteration 4 — `_decide_next_step` returns `"create"`**
+
+`session["outfit_suggestion"]` is set but `session["fit_card"]` is `None` and no error, so the decision function selects the create step.
+
+**Call `create_fit_card(outfit_suggestion, selected_item)`**
 
 The tool takes the outfit suggestion string and the listing dict, builds a prompt asking the LLM (at temperature ~0.9) for a 2–4 sentence Instagram/TikTok caption that mentions the item name, $24.00 price, and depop platform naturally.
 
@@ -347,6 +365,10 @@ The Groq LLM returns:
 > "just copped this 2003 bootleg graphic tee off depop for $24 and it might be the hardest thing in my closet rn. tucked into my baggiest jeans with the denim jacket and chunky sneakers — full streetwear mode activated. thrifted fits hit different when the tee already looks perfectly worn in."
 
 Stored in `session["fit_card"]`.
+
+**Loop iteration 5 — `_decide_next_step` returns `"done"`**
+
+All output fields are populated and no error is set. The loop breaks and the session is returned.
 
 **Final output to user:**
 
@@ -376,4 +398,4 @@ Vintage-style bootleg tee with faded graphic. Slightly boxy fit.
 **Panel 3 — Your Fit Card:**
 > just copped this 2003 bootleg graphic tee off depop for $24 and it might be the hardest thing in my closet rn. tucked into my baggiest jeans with the denim jacket and chunky sneakers — full streetwear mode activated. thrifted fits hit different when the tee already looks perfectly worn in.
 
-**Error path example:** If the user searched for "designer ballgown size XXS under $5", `search_listings` would return an empty list. The agent would set `session["error"]` to "No matching listings found for your search. Try broadening your description, removing the size or price filter, or searching for a different item." and return immediately. The Gradio UI would show this error in Panel 1, with Panels 2 and 3 empty.
+**Error path example:** If the user searched for "designer ballgown size XXS under $5", the loop would run parse → search. `search_listings` would return an empty list, so the agent sets `session["error"]`. On the next iteration, `_decide_next_step` sees the error and returns `"done"` — the loop breaks without ever calling `suggest_outfit` or `create_fit_card`. The Gradio UI would show the error message in Panel 1, with Panels 2 and 3 empty.
