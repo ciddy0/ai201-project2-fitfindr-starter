@@ -18,6 +18,8 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
@@ -92,9 +94,71 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # 1. Init session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # 2. Parse query — regex-based extraction
+    text = query.lower()
+
+    # Extract max_price
+    max_price = None
+    price_match = re.search(r'(?:under|below|less than|max|<)\s*\$?\s*(\d+(?:\.\d{1,2})?)', text)
+    if price_match:
+        max_price = float(price_match.group(1))
+
+    # Extract size
+    size = None
+    size_match = re.search(r'(?:in\s+)?size\s+(\w+)', text)
+    if size_match:
+        size = size_match.group(1).upper()
+
+    # Extract description — remove price/size phrases, strip filler
+    description = query
+    if price_match:
+        description = re.sub(r'(?:under|below|less than|max|<)\s*\$?\s*\d+(?:\.\d{1,2})?', '', description, flags=re.IGNORECASE)
+    if size_match:
+        description = re.sub(r'(?:in\s+)?size\s+\w+', '', description, flags=re.IGNORECASE)
+    description = re.sub(r'[,.\-]+$', '', description).strip()
+    # Remove common filler phrases
+    description = re.sub(r"(?i)^(i'm |i am )?(looking for|searching for|find me|i want|i need)\s+(a |an )?", '', description).strip()
+
+    session["parsed"] = {
+        "description": description,
+        "size": size,
+        "max_price": max_price,
+    }
+
+    # 3. Search
+    session["search_results"] = search_listings(
+        description=session["parsed"]["description"],
+        size=session["parsed"]["size"],
+        max_price=session["parsed"]["max_price"],
+    )
+
+    if not session["search_results"]:
+        session["error"] = (
+            "No matching listings found for your search. "
+            "Try broadening your description, removing the size or price filter, "
+            "or searching for a different item."
+        )
+        return session
+
+    # 4. Select top result
+    session["selected_item"] = session["search_results"][0]
+
+    # 5. Suggest outfit
+    session["outfit_suggestion"] = suggest_outfit(
+        new_item=session["selected_item"],
+        wardrobe=session["wardrobe"],
+    )
+
+    # 6. Create fit card
+    session["fit_card"] = create_fit_card(
+        outfit=session["outfit_suggestion"],
+        new_item=session["selected_item"],
+    )
+
+    # 7. Return session
     return session
 
 
